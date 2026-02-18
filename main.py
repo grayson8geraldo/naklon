@@ -383,7 +383,12 @@ def cmd_monitor(config: dict, args: argparse.Namespace):
     }
     interval = tf_seconds.get(timeframe, 300)
 
-    fetcher = DataFetcher(config)
+    # For --top-volume, force live exchange (public data, no keys needed)
+    if args.top_volume:
+        live_config = {**config, "exchange": {**config.get("exchange", {}), "testnet": False}}
+        fetcher = DataFetcher(live_config)
+    else:
+        fetcher = DataFetcher(config)
 
     # Determine which symbols to monitor
     if args.symbol:

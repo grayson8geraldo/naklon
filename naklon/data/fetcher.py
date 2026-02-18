@@ -30,9 +30,10 @@ class DataFetcher:
         self.exchange_name = exchange_cfg.get("name", "binance")
         self.testnet = exchange_cfg.get("testnet", True)
         self._exchange = None
+        self._exchange_live = None
 
     def _get_exchange(self):
-        """Lazy-initialize the exchange connection."""
+        """Lazy-initialize the exchange connection (respects testnet setting)."""
         if self._exchange is None:
             import ccxt
             exchange_class = getattr(ccxt, self.exchange_name)
@@ -43,6 +44,17 @@ class DataFetcher:
                 self._exchange.set_sandbox_mode(True)
             self._exchange.load_markets()
         return self._exchange
+
+    def _get_live_exchange(self):
+        """Get a real (non-testnet) exchange connection for public data like tickers."""
+        if self._exchange_live is None:
+            import ccxt
+            exchange_class = getattr(ccxt, self.exchange_name)
+            self._exchange_live = exchange_class({
+                "enableRateLimit": True,
+            })
+            self._exchange_live.load_markets()
+        return self._exchange_live
 
     def fetch_ohlcv(
         self,
@@ -113,15 +125,25 @@ class DataFetcher:
         top_n: int = 20,
         min_volume_usd: float = 50_000_000,
     ) -> list[dict]:
-        """Fetch USDT futures pairs sorted by 24h volume.
+        """Fetch USDT pairs sorted by 24h volume from real exchange.
+
+        Always uses the live (non-testnet) exchange — tickers are public data.
 
         Returns list of dicts: {symbol, volume_usd, price, change_pct}
         sorted by volume descending.
         """
-        exchange = self._get_exchange()
+        exchange = self._get_live_exchange()
 
         logger.info("Fetching tickers to find top volume %s pairs...", quote)
-        tickers = exchange.fetch_tickers()
+        try:
+            tickers = exchange.fetch_tickers()
+        except Exception as e:
+            logger.error("Failed to fetch tickers: %s", e)
+            return []
+
+        if not tickers:
+            logger.warning("Exchange returned empty tickers")
+            return []
 
         pairs = []
         for symbol, ticker in tickers.items():
