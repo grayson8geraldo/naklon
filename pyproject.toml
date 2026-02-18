@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "naklon"
+version = "1.0.0"
+description = "Crypto intraday trendline (наклонки) trading strategy — $10,000 capital"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "ccxt>=4.0.0",
+    "ta>=0.11.0",
+    "scipy>=1.11.0",
+    "plotly>=5.18.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+naklon = "main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

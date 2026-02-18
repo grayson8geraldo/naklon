@@ -1,0 +1,84 @@
+# Naklon — Crypto Intraday Trendline Trading Strategy
+# Конфигурация стратегии торговли по наклонкам
+
+capital:
+  initial: 10000          # Начальный капитал в USD
+  currency: USDT
+
+exchange:
+  name: binance
+  type: spot               # spot / futures
+  testnet: true            # Использовать тестовую сеть
+
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+
+timeframes:
+  primary: 15m             # Основной таймфрейм для входа
+  trend: 1h                # Таймфрейм для определения тренда
+  confirmation: 5m         # Таймфрейм для подтверждения
+
+trendline:
+  min_touches: 3           # Минимум касаний для валидной наклонки
+  lookback_bars: 120       # Количество баров для поиска наклонок
+  touch_tolerance_pct: 0.15  # Допуск касания в % от цены
+  break_threshold_pct: 0.3   # Порог пробоя наклонки в %
+  min_slope_angle_deg: 10    # Минимальный угол наклона (градусы)
+  max_slope_angle_deg: 80    # Максимальный угол наклона (градусы)
+  pivot_left_bars: 5         # Баров слева для определения пивота
+  pivot_right_bars: 3        # Баров справа для определения пивота
+
+indicators:
+  rsi:
+    period: 14
+    overbought: 70
+    oversold: 30
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  ema:
+    fast: 9
+    slow: 21
+    trend: 50
+  bollinger:
+    period: 20
+    std_dev: 2.0
+  atr:
+    period: 14
+  volume:
+    ma_period: 20
+    spike_multiplier: 1.5   # Объём > 1.5x среднего = спайк
+
+risk_management:
+  max_risk_per_trade_pct: 1.0    # Максимум 1% капитала на сделку
+  max_open_positions: 3           # Максимум одновременных позиций
+  default_rr_ratio: 2.0           # Risk:Reward по умолчанию 1:2
+  max_daily_loss_pct: 3.0         # Максимальный дневной убыток 3%
+  trailing_stop_activation_pct: 1.5  # Активация трейлинг-стопа
+  trailing_stop_distance_pct: 0.5    # Дистанция трейлинг-стопа
+
+entry_rules:
+  require_trendline_break: true
+  require_volume_confirmation: true
+  require_retest: false            # Ждать ретеста наклонки
+  min_rsi_for_long: 35             # Минимальный RSI для лонга
+  max_rsi_for_long: 65             # Максимальный RSI для лонга
+  min_rsi_for_short: 35
+  max_rsi_for_short: 65
+  macd_confirmation: true          # Требовать подтверждение MACD
+  ema_trend_filter: true           # Фильтр направления EMA
+  wait_candles_after_break: 1      # Ожидание свечей после пробоя
+
+exit_rules:
+  take_profit_at_rr: 2.0           # Тейк-профит при R:R
+  partial_take_profit_pct: 50      # Частичное закрытие %
+  partial_tp_at_rr: 1.0            # Частичный ТП при R:R
+  use_trailing_stop: true
+  exit_on_opposite_signal: true    # Выход при обратном сигнале
+
+logging:
+  level: INFO
+  file: logs/naklon.log
