@@ -107,6 +107,58 @@ class DataFetcher:
         logger.info("Fetched %d candles for %s", len(df), symbol)
         return df
 
+    def fetch_top_volume_symbols(
+        self,
+        quote: str = "USDT",
+        top_n: int = 20,
+        min_volume_usd: float = 50_000_000,
+    ) -> list[dict]:
+        """Fetch USDT futures pairs sorted by 24h volume.
+
+        Returns list of dicts: {symbol, volume_usd, price, change_pct}
+        sorted by volume descending.
+        """
+        exchange = self._get_exchange()
+
+        logger.info("Fetching tickers to find top volume %s pairs...", quote)
+        tickers = exchange.fetch_tickers()
+
+        pairs = []
+        for symbol, ticker in tickers.items():
+            # Only USDT pairs, skip stablecoins and leveraged tokens
+            if not symbol.endswith(f"/{quote}"):
+                continue
+            base = symbol.split("/")[0]
+            skip = ("USDC", "BUSD", "DAI", "TUSD", "FDUSD", "UP", "DOWN", "BEAR", "BULL")
+            if any(base.endswith(s) or base.startswith(s) for s in skip):
+                continue
+
+            last_price = ticker.get("last") or ticker.get("close") or 0
+            vol_base = ticker.get("baseVolume") or 0
+            vol_usd = vol_base * last_price if last_price else 0
+            # Fallback: use quoteVolume directly
+            if vol_usd == 0:
+                vol_usd = ticker.get("quoteVolume") or 0
+
+            change_pct = ticker.get("percentage") or 0
+
+            if vol_usd < min_volume_usd:
+                continue
+            if last_price <= 0:
+                continue
+
+            pairs.append({
+                "symbol": symbol,
+                "price": last_price,
+                "volume_usd": vol_usd,
+                "change_pct": change_pct,
+            })
+
+        pairs.sort(key=lambda x: x["volume_usd"], reverse=True)
+        result = pairs[:top_n]
+        logger.info("Found %d active pairs (from %d total)", len(result), len(pairs))
+        return result
+
     def fetch_multi_timeframe(
         self,
         symbol: str,

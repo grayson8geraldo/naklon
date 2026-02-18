@@ -345,16 +345,32 @@ def cmd_backtest(config: dict, args: argparse.Namespace):
         print(f"  Результаты сохранены: {args.output}")
 
 
-def cmd_monitor(config: dict, args: argparse.Namespace):
-    """Live monitoring mode — monitors one or all symbols for signals."""
-    logger = setup_logger("naklon", "WARNING")
+def _scan_active_pairs(fetcher, top_n=20, min_vol=50_000_000):
+    """Scan exchange for top volume USDT pairs."""
+    print(f"\n  Сканирую биржу — ищу активные пары по объёму...")
+    pairs = fetcher.fetch_top_volume_symbols(top_n=top_n, min_volume_usd=min_vol)
 
-    if args.symbol:
-        symbols = [args.symbol]
-    elif args.all:
-        symbols = config["symbols"]
-    else:
-        symbols = config["symbols"]  # По умолчанию — все пары
+    if not pairs:
+        print(f"  Не удалось получить тикеры с биржи.")
+        return []
+
+    print(f"\n  {'='*64}")
+    print(f"  ТОП-{len(pairs)} ПАР ПО ОБЪЁМУ (24ч)")
+    print(f"  {'='*64}")
+    for i, p in enumerate(pairs, 1):
+        vol_m = p["volume_usd"] / 1_000_000
+        chg = p["change_pct"]
+        chg_str = f"+{chg:.1f}%" if chg >= 0 else f"{chg:.1f}%"
+        print(f"  {i:2d}. {p['symbol']:14s} {format_price(p['price']):>12s} | "
+              f"Vol: ${vol_m:,.0f}M | {chg_str}")
+    print(f"  {'='*64}\n")
+
+    return [p["symbol"] for p in pairs]
+
+
+def cmd_monitor(config: dict, args: argparse.Namespace):
+    """Live monitoring mode — monitors active or specified symbols for signals."""
+    logger = setup_logger("naklon", "WARNING")
 
     timeframe = config["timeframes"]["primary"]
     leverage = config.get("risk_management", {}).get("leverage", 10)
@@ -367,25 +383,68 @@ def cmd_monitor(config: dict, args: argparse.Namespace):
     }
     interval = tf_seconds.get(timeframe, 300)
 
+    fetcher = DataFetcher(config)
+
+    # Determine which symbols to monitor
+    if args.symbol:
+        symbols = [args.symbol]
+        mode = "single"
+    elif args.top_volume:
+        top_n = args.top_n
+        min_vol = args.min_vol * 1_000_000
+        symbols = _scan_active_pairs(fetcher, top_n=top_n, min_vol=min_vol)
+        if not symbols:
+            print("  Нет активных пар. Проверь подключение к бирже.")
+            sys.exit(1)
+        mode = "volume"
+    else:
+        symbols = config["symbols"]
+        mode = "config"
+
     print()
-    print(f"  {'='*56}")
-    if len(symbols) == 1:
+    print(f"  {'='*64}")
+    if mode == "single":
         print(f"  МОНИТОРИНГ — {symbols[0]} | {timeframe} | x{leverage}")
+    elif mode == "volume":
+        print(f"  МОНИТОРИНГ — ТОП {len(symbols)} АКТИВНЫХ ПАР | {timeframe} | x{leverage}")
     else:
         print(f"  МОНИТОРИНГ — {len(symbols)} пар | {timeframe} | x{leverage}")
         for sym in symbols:
             print(f"    - {sym}")
     print(f"  Обновление каждые {interval // 60} мин. Ctrl+C для выхода.")
-    print(f"  {'='*56}")
+    if mode == "volume":
+        rescan_mins = args.rescan
+        print(f"  Пересканирование объёмов каждые {rescan_mins} мин.")
+    print(f"  {'='*64}")
     print()
 
-    fetcher = DataFetcher(config)
     last_signal_bars = {sym: -1 for sym in symbols}
+    last_rescan = time.time()
+    rescan_interval = args.rescan * 60 if mode == "volume" else float("inf")
 
     try:
         while True:
             from datetime import datetime
             now = datetime.now().strftime("%H:%M:%S")
+
+            # Rescan for active pairs periodically
+            if mode == "volume" and (time.time() - last_rescan) >= rescan_interval:
+                print(f"\n  [{now}] Пересканирование активных пар...\n")
+                new_symbols = _scan_active_pairs(fetcher, top_n=top_n, min_vol=min_vol)
+                if new_symbols:
+                    added = set(new_symbols) - set(symbols)
+                    removed = set(symbols) - set(new_symbols)
+                    if added:
+                        print(f"  + Новые: {', '.join(added)}")
+                    if removed:
+                        print(f"  - Ушли: {', '.join(removed)}")
+                    symbols = new_symbols
+                    for sym in symbols:
+                        if sym not in last_signal_bars:
+                            last_signal_bars[sym] = -1
+                last_rescan = time.time()
+
+            found_any = False
 
             for symbol in symbols:
                 df = fetcher.fetch_ohlcv(symbol, timeframe, limit=200)
@@ -402,8 +461,9 @@ def cmd_monitor(config: dict, args: argparse.Namespace):
 
                 if signals:
                     s = signals[0]
-                    if s.bar_idx != last_signal_bars[symbol]:
+                    if s.bar_idx != last_signal_bars.get(symbol, -1):
                         last_signal_bars[symbol] = s.bar_idx
+                        found_any = True
                         print(f"\n  !!! НОВЫЙ СИГНАЛ {symbol} в {ts} !!!\n")
                         print_signal_card(s, config, config["capital"]["initial"])
                 else:
@@ -412,13 +472,13 @@ def cmd_monitor(config: dict, args: argparse.Namespace):
                     r = df_ind.iloc[-1]
                     detector = TrendlineDetector(config)
                     tls = detector.detect_trendlines(df)
-                    print(f"  [{now}] {symbol:12s} = {format_price(price)} | "
+                    tl_str = f"Наклонок: {len(tls)}" if len(tls) > 0 else "Нет наклонок"
+                    print(f"  [{now}] {symbol:14s} = {format_price(price)} | "
                           f"RSI: {r.get('rsi', 0):.0f} | "
-                          f"Наклонок: {len(tls)} | "
-                          f"Ждём...")
+                          f"{tl_str} | Ждём...")
 
             if len(symbols) > 1:
-                print(f"  {'─'*56}")
+                print(f"  {'─'*64}")
 
             time.sleep(interval)
 
@@ -436,7 +496,9 @@ def main():
   python main.py signal --symbol BTC/USDT --live  Сигнал по реальным данным
   python main.py scan --live                      Сканировать все пары
   python main.py backtest --bars 3000             Бэктест
-  python main.py monitor --symbol ETH/USDT        Мониторинг в реалтайме
+  python main.py monitor                          Мониторинг 5 пар
+  python main.py monitor --top-volume             Мониторинг ТОП пар по объёму
+  python main.py monitor -V --top-n 10            ТОП-10 самых активных пар
         """,
     )
     parser.add_argument("--config", "-c", default=None, help="Путь к config.yaml")
@@ -467,10 +529,26 @@ def main():
     bt.add_argument("--output", "-o", default=None, help="Сохранить в JSON")
 
     # Monitor command
-    mo = subparsers.add_parser("monitor", help="Мониторинг сигналов")
-    mo.add_argument("--symbol", "-s", default=None, help="Одна пара (по умолчанию все)")
+    mo = subparsers.add_parser("monitor", help="Мониторинг сигналов",
+                               formatter_class=argparse.RawDescriptionHelpFormatter,
+                               epilog="""
+Режимы:
+  python main.py monitor                          5 пар из конфига
+  python main.py monitor --top-volume             ТОП-20 пар по объёму (живые)
+  python main.py monitor --top-volume --top-n 10  ТОП-10 пар по объёму
+  python main.py monitor --symbol SOL/USDT        Одна пара
+""")
+    mo.add_argument("--symbol", "-s", default=None, help="Одна пара")
     mo.add_argument("--all", "-a", action="store_true", default=False,
-                    help="Все пары из config.yaml (по умолчанию)")
+                    help="Все пары из config.yaml")
+    mo.add_argument("--top-volume", "-V", action="store_true", default=False,
+                    help="Автопоиск активных пар по объёму на бирже")
+    mo.add_argument("--top-n", type=int, default=20,
+                    help="Сколько топ пар мониторить (по умолч. 20)")
+    mo.add_argument("--min-vol", type=float, default=50,
+                    help="Мин. объём в млн $ (по умолч. 50)")
+    mo.add_argument("--rescan", type=int, default=30,
+                    help="Пересканировать объёмы каждые N мин (по умолч. 30)")
 
     args = parser.parse_args()
 
