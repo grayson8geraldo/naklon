@@ -346,10 +346,16 @@ def cmd_backtest(config: dict, args: argparse.Namespace):
 
 
 def cmd_monitor(config: dict, args: argparse.Namespace):
-    """Live monitoring mode — prints signals as they appear."""
+    """Live monitoring mode — monitors one or all symbols for signals."""
     logger = setup_logger("naklon", "WARNING")
 
-    symbol = args.symbol or config["symbols"][0]
+    if args.symbol:
+        symbols = [args.symbol]
+    elif args.all:
+        symbols = config["symbols"]
+    else:
+        symbols = config["symbols"]  # По умолчанию — все пары
+
     timeframe = config["timeframes"]["primary"]
     leverage = config.get("risk_management", {}).get("leverage", 10)
 
@@ -362,46 +368,57 @@ def cmd_monitor(config: dict, args: argparse.Namespace):
     interval = tf_seconds.get(timeframe, 300)
 
     print()
-    print(f"  {'='*52}")
-    print(f"  МОНИТОРИНГ — {symbol} | {timeframe} | x{leverage}")
+    print(f"  {'='*56}")
+    if len(symbols) == 1:
+        print(f"  МОНИТОРИНГ — {symbols[0]} | {timeframe} | x{leverage}")
+    else:
+        print(f"  МОНИТОРИНГ — {len(symbols)} пар | {timeframe} | x{leverage}")
+        for sym in symbols:
+            print(f"    - {sym}")
     print(f"  Обновление каждые {interval // 60} мин. Ctrl+C для выхода.")
-    print(f"  {'='*52}")
+    print(f"  {'='*56}")
     print()
 
     fetcher = DataFetcher(config)
-    last_signal_bar = -1
+    last_signal_bars = {sym: -1 for sym in symbols}
 
     try:
         while True:
-            df = fetcher.fetch_ohlcv(symbol, timeframe, limit=200)
-            if df.empty:
-                print("  Нет данных, повтор через 30с...")
-                time.sleep(30)
-                continue
+            from datetime import datetime
+            now = datetime.now().strftime("%H:%M:%S")
 
-            signal_gen = SignalGenerator(config)
-            signals = signal_gen.generate_signals(df, symbol, timeframe)
+            for symbol in symbols:
+                df = fetcher.fetch_ohlcv(symbol, timeframe, limit=200)
+                if df.empty:
+                    print(f"  [{now}] {symbol}: нет данных")
+                    continue
 
-            last = df.iloc[-1]
-            ts = str(last.get("timestamp", ""))[:19]
-            price = last["close"]
+                signal_gen = SignalGenerator(config)
+                signals = signal_gen.generate_signals(df, symbol, timeframe)
 
-            if signals:
-                s = signals[0]
-                if s.bar_idx != last_signal_bar:
-                    last_signal_bar = s.bar_idx
-                    print(f"\n  !!! НОВЫЙ СИГНАЛ в {ts} !!!\n")
-                    print_signal_card(s, config, config["capital"]["initial"])
-            else:
-                indicators = TechnicalIndicators(config)
-                df_ind = indicators.calculate_all(df)
-                r = df_ind.iloc[-1]
-                detector = TrendlineDetector(config)
-                tls = detector.detect_trendlines(df)
-                print(f"  [{ts}] {symbol} = {format_price(price)} | "
-                      f"RSI: {r.get('rsi', 0):.0f} | "
-                      f"Наклонок: {len(tls)} | "
-                      f"Ждём...")
+                last = df.iloc[-1]
+                ts = str(last.get("timestamp", ""))[:19]
+                price = last["close"]
+
+                if signals:
+                    s = signals[0]
+                    if s.bar_idx != last_signal_bars[symbol]:
+                        last_signal_bars[symbol] = s.bar_idx
+                        print(f"\n  !!! НОВЫЙ СИГНАЛ {symbol} в {ts} !!!\n")
+                        print_signal_card(s, config, config["capital"]["initial"])
+                else:
+                    indicators = TechnicalIndicators(config)
+                    df_ind = indicators.calculate_all(df)
+                    r = df_ind.iloc[-1]
+                    detector = TrendlineDetector(config)
+                    tls = detector.detect_trendlines(df)
+                    print(f"  [{now}] {symbol:12s} = {format_price(price)} | "
+                          f"RSI: {r.get('rsi', 0):.0f} | "
+                          f"Наклонок: {len(tls)} | "
+                          f"Ждём...")
+
+            if len(symbols) > 1:
+                print(f"  {'─'*56}")
 
             time.sleep(interval)
 
@@ -451,7 +468,9 @@ def main():
 
     # Monitor command
     mo = subparsers.add_parser("monitor", help="Мониторинг сигналов")
-    mo.add_argument("--symbol", "-s", default=None, help="Торговая пара")
+    mo.add_argument("--symbol", "-s", default=None, help="Одна пара (по умолчанию все)")
+    mo.add_argument("--all", "-a", action="store_true", default=False,
+                    help="Все пары из config.yaml (по умолчанию)")
 
     args = parser.parse_args()
 
