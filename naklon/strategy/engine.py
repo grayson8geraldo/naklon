@@ -1,12 +1,11 @@
 """
-Strategy Engine — Core orchestrator
+Strategy Engine v2.0 — Core orchestrator
 
-Основной движок стратегии «Наклонки»:
-1. Получает данные с биржи
-2. Детектирует наклонки и пробои
-3. Генерирует сигналы с подтверждением
-4. Управляет позициями и рисками
-5. Логирует все действия
+Рабочий цикл:
+1. Проверка режима рынка (не торгуем в squeeze)
+2. Генерация сигналов по наклонкам с 6 подтверждениями
+3. Smart стоп-лосс + 3-уровневый тейк-профит
+4. Адаптивное плечо + градуированные лимиты
 """
 
 import logging
@@ -22,14 +21,7 @@ logger = logging.getLogger("naklon.engine")
 
 
 class StrategyEngine:
-    """Main strategy engine that orchestrates all components.
-
-    Рабочий цикл:
-    1. on_new_candle() вызывается при каждой новой свече
-    2. Генерируются сигналы по наклонкам
-    3. Проверяются фильтры и риск-менеджмент
-    4. Открываются/закрываются позиции
-    """
+    """Main strategy engine with regime filtering and adaptive risk."""
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -38,12 +30,16 @@ class StrategyEngine:
 
         exit_cfg = config.get("exit_rules", {})
         self.exit_on_opposite = exit_cfg.get("exit_on_opposite_signal", True)
+        self.tp1_rr = exit_cfg.get("tp1_at_rr", 0.75)
+        self.tp2_rr = exit_cfg.get("tp2_at_rr", 1.5)
+        self.tp3_rr = exit_cfg.get("tp3_at_rr", 3.0)
 
         self.symbols = config.get("symbols", ["BTC/USDT"])
-        self.primary_tf = config.get("timeframes", {}).get("primary", "15m")
+        self.primary_tf = config.get("timeframes", {}).get("primary", "5m")
 
         self._last_signals: dict[str, TradeSignal] = {}
         self._trade_log: list[dict] = []
+        self._bar_counter = 0
 
     def on_new_candle(
         self,
@@ -51,32 +47,27 @@ class StrategyEngine:
         df: pd.DataFrame,
         current_time: datetime,
     ) -> list[TradeSignal]:
-        """Process a new candle and generate/execute trading actions.
+        """Process a new candle."""
+        self._bar_counter += 1
+        self.risk_manager.set_current_bar(self._bar_counter)
 
-        This is the main entry point called on every new candle.
-
-        Args:
-            symbol: Trading pair symbol.
-            df: OHLCV DataFrame up to the current candle.
-            current_time: Timestamp of the current candle.
-
-        Returns:
-            List of signals generated (for logging/display).
-        """
-        # Update existing positions
         current_price = df["close"].iloc[-1]
         self.risk_manager.update_positions({symbol: current_price}, current_time)
 
-        # Check risk limits
         metrics = self.risk_manager.get_metrics()
         if metrics.max_daily_loss_reached:
             logger.warning(
-                "Daily loss limit reached (%.2f%%). No new trades.",
+                "HARD DAILY LIMIT (%.2f%%). Trading stopped.",
                 metrics.daily_pnl_pct,
             )
             return []
 
-        # Generate signals
+        if metrics.soft_limit_reached:
+            logger.info(
+                "SOFT DAILY LIMIT (%.2f%%). Position size halved.",
+                metrics.daily_pnl_pct,
+            )
+
         signals = self.signal_generator.generate_signals(
             df, symbol, self.primary_tf,
         )
@@ -90,22 +81,11 @@ class StrategyEngine:
         return executed_signals
 
     def _process_signal(self, signal: TradeSignal, current_time: datetime) -> bool:
-        """Process a single trade signal.
-
-        Args:
-            signal: Validated trade signal.
-            current_time: Current timestamp.
-
-        Returns:
-            True if a trade was executed.
-        """
         symbol = signal.symbol
 
-        # Check for opposite signal — close existing position
         if self.exit_on_opposite:
             self._close_opposite_positions(signal, current_time)
 
-        # Check if already have a position in the same direction
         existing = self._get_open_positions(symbol)
         for pos in existing:
             if (
@@ -117,30 +97,30 @@ class StrategyEngine:
                 )
                 return False
 
-        # Calculate position size
         quantity = self.risk_manager.calculate_position_size(
             signal.entry_price, signal.stop_loss, symbol,
         )
         if quantity is None:
             logger.info(
-                "Position rejected by risk manager for %s (signal score: %.1f).",
+                "Position rejected by risk manager for %s (score: %.1f).",
                 symbol, signal.score,
             )
             return False
 
-        # Open position
         side = (
             PositionSide.LONG if signal.type == SignalType.LONG else PositionSide.SHORT
         )
 
-        # Calculate TP1 (partial) and TP2 (full) based on R:R
+        # Calculate 3-level TP
         risk = abs(signal.entry_price - signal.stop_loss)
         if signal.type == SignalType.LONG:
-            tp1 = signal.entry_price + risk * 1.0   # TP1 at R:R 1:1
-            tp2 = signal.entry_price + risk * 2.0   # TP2 at R:R 1:2
+            tp1 = signal.entry_price + risk * self.tp1_rr
+            tp2 = signal.entry_price + risk * self.tp2_rr
+            tp3 = signal.entry_price + risk * self.tp3_rr
         else:
-            tp1 = signal.entry_price - risk * 1.0
-            tp2 = signal.entry_price - risk * 2.0
+            tp1 = signal.entry_price - risk * self.tp1_rr
+            tp2 = signal.entry_price - risk * self.tp2_rr
+            tp3 = signal.entry_price - risk * self.tp3_rr
 
         leverage = self.risk_manager.leverage
         margin = (quantity * signal.entry_price) / leverage
@@ -155,9 +135,9 @@ class StrategyEngine:
             take_profit=tp1,
             entry_time=current_time,
             take_profit_2=tp2,
+            take_profit_3=tp3,
         )
 
-        # Log the trade
         risk_amount = abs(signal.entry_price - signal.stop_loss) * quantity
         trade_info = {
             "time": current_time.isoformat(),
@@ -172,10 +152,12 @@ class StrategyEngine:
             "stop_loss": signal.stop_loss,
             "tp1": round(tp1, 2),
             "tp2": round(tp2, 2),
+            "tp3": round(tp3, 2),
             "risk_amount": round(risk_amount, 2),
             "risk_reward": signal.risk_reward,
             "signal_score": signal.score,
             "signal_strength": signal.strength.value,
+            "market_regime": signal.market_regime,
             "trendline_type": signal.breakout.trendline.type.value,
             "trendline_touches": signal.breakout.trendline.touches,
             "trendline_angle": round(signal.breakout.trendline.angle_deg, 1),
@@ -185,17 +167,18 @@ class StrategyEngine:
         self._trade_log.append(trade_info)
 
         logger.info(
-            "OPEN %s %s x%d | Entry: %.2f | SL: %.2f | TP1: %.2f | TP2: %.2f | "
-            "Margin: $%.2f | Risk: $%.2f | Score: %.1f",
+            "OPEN %s %s x%d | Entry: %.2f | SL: %.2f | TP1: %.2f | TP2: %.2f | TP3: %.2f | "
+            "Margin: $%.2f | Risk: $%.2f | Score: %.1f | Regime: %s",
             side.value.upper(),
             symbol,
             leverage,
             signal.entry_price,
             signal.stop_loss,
-            tp1, tp2,
+            tp1, tp2, tp3,
             margin,
             risk_amount,
             signal.score,
+            signal.market_regime,
         )
 
         self._last_signals[symbol] = signal
@@ -204,7 +187,6 @@ class StrategyEngine:
     def _close_opposite_positions(
         self, signal: TradeSignal, current_time: datetime,
     ):
-        """Close positions that are opposite to the new signal."""
         for pos in self._get_open_positions(signal.symbol):
             is_opposite = (
                 (signal.type == SignalType.LONG and pos.side == PositionSide.SHORT)
@@ -222,7 +204,6 @@ class StrategyEngine:
                 )
 
     def _get_open_positions(self, symbol: str) -> list:
-        """Get open positions for a symbol."""
         from naklon.strategy.risk import PositionStatus
         return [
             p for p in self.risk_manager.positions
@@ -230,15 +211,9 @@ class StrategyEngine:
         ]
 
     def get_trade_log(self) -> list[dict]:
-        """Return the trade log."""
         return self._trade_log
 
     def get_performance_summary(self) -> dict:
-        """Generate performance summary.
-
-        Returns:
-            Dictionary with performance metrics.
-        """
         closed = self.risk_manager.closed_positions
         if not closed:
             return {
@@ -255,7 +230,6 @@ class StrategyEngine:
         avg_win = sum(p.realized_pnl for p in wins) / len(wins) if wins else 0
         avg_loss = sum(p.realized_pnl for p in losses) / len(losses) if losses else 0
 
-        # Profit factor
         gross_profit = sum(p.realized_pnl for p in wins)
         gross_loss = abs(sum(p.realized_pnl for p in losses))
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")

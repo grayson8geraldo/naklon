@@ -1,4 +1,4 @@
-# Naklon — Стратегия разгона депозита по наклонкам
+# Naklon — Стратегия разгона депозита по наклонкам v2.0
 # Агрессивная интрадей торговля криптовалют на 5м ТФ
 # Депозит: $100-200, фьючерсы с плечом
 
@@ -21,24 +21,26 @@ symbols:
 
 timeframes:
   primary: 5m              # Основной ТФ — 5 минут (быстрые входы)
-  trend: 15m               # Направление тренда
+  trend: 15m               # Направление тренда (фильтр)
   confirmation: 1m         # Точный вход
 
 trendline:
   min_touches: 2           # 2 касания — быстрее находит наклонки
   lookback_bars: 80        # 80 баров = ~7 часов на 5м
-  touch_tolerance_pct: 0.2   # Чуть шире допуск касания
-  break_threshold_pct: 0.15  # Порог пробоя ниже — ловим раньше
-  min_slope_angle_deg: 5     # Пологие наклонки тоже считаем
-  max_slope_angle_deg: 85    # Почти вертикальные тоже
-  pivot_left_bars: 3         # Меньше баров — больше пивотов
-  pivot_right_bars: 2        # Быстрее определяем пивот
+  touch_tolerance_atr: 1.0   # Допуск = 1.0 ATR (вместо % от цены)
+  break_threshold_pct: 0.3   # Порог пробоя 0.3% — отсекает шум
+  min_slope_angle_deg: 8     # Минимальный угол — отсекаем горизонт
+  max_slope_angle_deg: 60    # Максимальный — отсекаем вертикаль
+  pivot_left_bars: 5         # Больше баров слева = надёжнее пивоты
+  pivot_right_bars: 3        # 3 бара подтверждения справа
+  recency_weight: 2.0        # Свежие касания весят в 2 раза больше
+  max_age_bars: 150           # Наклонка старше 150 баров = невалидна
 
 indicators:
   rsi:
     period: 14
-    overbought: 75           # Чуть выше — не фильтруем сильный тренд
-    oversold: 25
+    overbought: 70
+    oversold: 30
   macd:
     fast: 8                  # Быстрее реагирует на 5м
     slow: 21
@@ -52,37 +54,62 @@ indicators:
     std_dev: 2.0
   atr:
     period: 14
+  adx:
+    period: 14
+    trend_threshold: 20      # ADX > 20 = есть тренд
   volume:
     ma_period: 20
-    spike_multiplier: 1.3    # Ниже порог — больше подтверждений
+    spike_multiplier: 1.5    # Подтверждение объёмом 1.5x MA
+
+# === ФИЛЬТР РЕЖИМА РЫНКА ===
+# Стратегия НЕ торгует в боковике / при низкой волатильности
+market_regime:
+  require_trend: true          # Требовать ADX > порога
+  adx_min: 20                  # Минимальный ADX для торговли
+  atr_expansion_min: 0.8       # ATR / ATR_SMA(20) >= 0.8
+  bb_squeeze_skip: true        # Пропускать BB сжатие (низкая вола)
+  bb_squeeze_threshold: 0.6    # BB_width < 60% среднего = сжатие
 
 risk_management:
-  max_risk_per_trade_pct: 3.0     # 3% депозита на сделку ($4.5 при $150)
-  max_open_positions: 2            # Максимум 2 позиции одновременно
+  max_risk_per_trade_pct: 3.0     # 3% депозита на сделку
+  max_open_positions: 2            # Максимум 2 позиции
   default_rr_ratio: 2.0            # R:R минимум 1:2
-  max_daily_loss_pct: 10.0         # Дневной лимит 10% (разгон = агрессия)
-  trailing_stop_activation_pct: 1.0  # Трейлинг после +1%
-  trailing_stop_distance_pct: 0.4    # Трейлинг дистанция 0.4%
+  max_daily_loss_pct: 10.0         # Жёсткий лимит 10%
+  soft_daily_loss_pct: 5.0         # Мягкий лимит: уменьшить размер позиции
+  trailing_stop_activation_pct: 0.8  # Трейлинг после +0.8%
+  trailing_stop_distance_pct: 0.3    # Трейлинг дистанция 0.3%
   leverage: 10                      # Плечо x10
+  adaptive_leverage: true            # Уменьшать плечо при серии убытков
+  losing_streak_leverage_cut: 3      # После 3 убытков подряд: плечо / 2
+  slippage_pct: 0.05                 # Проскальзывание 0.05%
+  commission_pct: 0.04               # Комиссия тейкера 0.04%
 
 entry_rules:
   require_trendline_break: true
-  require_volume_confirmation: false   # Не ждём объём — входим сразу
-  require_retest: false                # Не ждём ретест — входим на пробое
-  min_rsi_for_long: 25                 # Шире диапазон RSI
-  max_rsi_for_long: 75
-  min_rsi_for_short: 25
-  max_rsi_for_short: 75
-  macd_confirmation: true              # MACD оставляем
-  ema_trend_filter: true               # EMA фильтр оставляем
+  require_volume_confirmation: true    # Требуем объём
+  require_retest: false                # Не ждём ретест (быстрый вход)
+  min_rsi_for_long: 30
+  max_rsi_for_long: 70
+  min_rsi_for_short: 30
+  max_rsi_for_short: 70
+  macd_confirmation: true
+  ema_trend_filter: true
   wait_candles_after_break: 0          # Входим СРАЗУ на пробое
+  min_signal_score: 50                 # Минимальный скор сигнала
+  require_candle_strength: true        # Свеча закрылась в верхних 40% диапазона
+  candle_strength_threshold: 0.4       # Для LONG: close в верхних 40% свечи
 
 exit_rules:
-  take_profit_at_rr: 2.0              # TP при R:R 1:2
-  partial_take_profit_pct: 50         # 50% закрываем на TP1
-  partial_tp_at_rr: 1.0               # TP1 при R:R 1:1
+  # 3-уровневая система тейк-профитов
+  tp1_at_rr: 0.75                     # TP1: R:R 1:0.75 (быстрый профит)
+  tp1_close_pct: 40                   # 40% позиции на TP1
+  tp2_at_rr: 1.5                      # TP2: R:R 1:1.5
+  tp2_close_pct: 35                   # 35% позиции на TP2
+  tp3_at_rr: 3.0                      # TP3: R:R 1:3 (большой ход)
+  tp3_close_pct: 25                   # 25% позиции на TP3
   use_trailing_stop: true
   exit_on_opposite_signal: true
+  max_hold_bars: 60                    # Максимум 60 баров = 5 часов на 5м
 
 logging:
   level: INFO

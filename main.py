@@ -38,15 +38,19 @@ def format_price(price: float) -> str:
 
 
 def print_signal_card(signal, config, equity=None):
-    """Print a clear, actionable signal card.
-
-    Формат: всё что нужно для входа — копируй цифры на биржу.
-    """
+    """Print a clear, actionable signal card with 3-level TP."""
     if equity is None:
         equity = config["capital"]["initial"]
 
     leverage = config.get("risk_management", {}).get("leverage", 10)
     risk_pct = config.get("risk_management", {}).get("max_risk_per_trade_pct", 3.0)
+    exit_cfg = config.get("exit_rules", {})
+    tp1_rr = exit_cfg.get("tp1_at_rr", 0.75)
+    tp2_rr = exit_cfg.get("tp2_at_rr", 1.5)
+    tp3_rr = exit_cfg.get("tp3_at_rr", 3.0)
+    tp1_close = exit_cfg.get("tp1_close_pct", 40)
+    tp2_close = exit_cfg.get("tp2_close_pct", 35)
+    tp3_close = exit_cfg.get("tp3_close_pct", 25)
 
     entry = signal.entry_price
     sl = signal.stop_loss
@@ -55,19 +59,23 @@ def print_signal_card(signal, config, equity=None):
     if signal.type == SignalType.LONG:
         direction = "LONG"
         arrow = "^"
-        tp1 = entry + risk * 1.0
-        tp2 = entry + risk * 2.0
+        tp1 = entry + risk * tp1_rr
+        tp2 = entry + risk * tp2_rr
+        tp3 = entry + risk * tp3_rr
         sl_pct = (entry - sl) / entry * 100
         tp1_pct = (tp1 - entry) / entry * 100
         tp2_pct = (tp2 - entry) / entry * 100
+        tp3_pct = (tp3 - entry) / entry * 100
     else:
         direction = "SHORT"
         arrow = "v"
-        tp1 = entry - risk * 1.0
-        tp2 = entry - risk * 2.0
+        tp1 = entry - risk * tp1_rr
+        tp2 = entry - risk * tp2_rr
+        tp3 = entry - risk * tp3_rr
         sl_pct = (sl - entry) / entry * 100
         tp1_pct = (entry - tp1) / entry * 100
         tp2_pct = (entry - tp2) / entry * 100
+        tp3_pct = (entry - tp3) / entry * 100
 
     # Position sizing
     risk_amount = equity * (risk_pct / 100)
@@ -76,43 +84,47 @@ def print_signal_card(signal, config, equity=None):
     margin = (quantity * entry) / leverage
     notional = quantity * entry
 
-    sl_pct_leverage = sl_pct * leverage
-    tp1_pct_leverage = tp1_pct * leverage
-    tp2_pct_leverage = tp2_pct * leverage
+    regime = getattr(signal, 'market_regime', 'unknown')
+    regime_label = {"trending": "ТРЕНД", "ranging": "БОКОВИК", "squeeze": "СЖАТИЕ"}.get(
+        regime, regime.upper())
 
     print()
-    print(f"  {'='*52}")
-    print(f"  {arrow}{arrow}{arrow}  {direction}  {signal.symbol}  x{leverage}  {arrow}{arrow}{arrow}")
-    print(f"  {'='*52}")
+    print(f"  {'='*56}")
+    print(f"  {arrow}{arrow}{arrow}  {direction}  {signal.symbol}  x{leverage}  [{regime_label}]  {arrow}{arrow}{arrow}")
+    print(f"  {'='*56}")
     print()
-    print(f"  ВХОД:          {format_price(entry)}")
-    print(f"  СТОП-ЛОСС:     {format_price(sl)}   (-{sl_pct:.2f}% / -{sl_pct_leverage:.1f}% с плечом)")
-    print(f"  ТЕЙК 1 (50%):  {format_price(tp1)}   (+{tp1_pct:.2f}% / +{tp1_pct_leverage:.1f}% с плечом)")
-    print(f"  ТЕЙК 2 (50%):  {format_price(tp2)}   (+{tp2_pct:.2f}% / +{tp2_pct_leverage:.1f}% с плечом)")
+    print(f"  ВХОД:               {format_price(entry)}")
+    print(f"  СТОП-ЛОСС:          {format_price(sl):>12s}   (-{sl_pct:.2f}% / -{sl_pct*leverage:.1f}% с плечом)")
+    print(f"  TP1 ({tp1_close}%, R:{tp1_rr}):  {format_price(tp1):>12s}   (+{tp1_pct:.2f}% / +{tp1_pct*leverage:.1f}% с плечом)")
+    print(f"  TP2 ({tp2_close}%, R:{tp2_rr}):  {format_price(tp2):>12s}   (+{tp2_pct:.2f}% / +{tp2_pct*leverage:.1f}% с плечом)")
+    print(f"  TP3 ({tp3_close}%, R:{tp3_rr}):  {format_price(tp3):>12s}   (+{tp3_pct:.2f}% / +{tp3_pct*leverage:.1f}% с плечом)")
     print()
-    print(f"  {'─'*52}")
+    print(f"  {'─'*56}")
     print(f"  Депозит:        ${equity:.2f}")
     print(f"  Маржа:          ${margin:.2f}")
     print(f"  Размер позиции: ${notional:.2f}")
     print(f"  Риск на сделку: ${risk_amount:.2f} ({risk_pct}%)")
     print()
-    print(f"  При TP1 (+R:R 1:1):  +${risk_amount:.2f} на депозит")
-    print(f"  При TP2 (+R:R 1:2):  +${risk_amount * 2:.2f} на депозит")
-    print(f"  При SL:              -${risk_amount:.2f} с депозита")
+    print(f"  При TP1 (R:{tp1_rr}):  +${risk_amount * tp1_rr:.2f}")
+    print(f"  При TP2 (R:{tp2_rr}):  +${risk_amount * tp2_rr:.2f}")
+    print(f"  При TP3 (R:{tp3_rr}):  +${risk_amount * tp3_rr:.2f}")
+    print(f"  При SL:            -${risk_amount:.2f}")
     print()
-    print(f"  {'─'*52}")
-    print(f"  Сила сигнала:   {signal.strength.value.upper()} ({signal.score:.0f}/100)")
+    print(f"  {'─'*56}")
+    print(f"  Сила:           {signal.strength.value.upper()} ({signal.score:.0f}/100)")
+    print(f"  Режим рынка:    {regime_label}")
     print(f"  Наклонка:       {signal.breakout.trendline.type.value} | "
           f"касаний: {signal.breakout.trendline.touches} | "
           f"угол: {signal.breakout.trendline.angle_deg:.1f}")
     print(f"  Пробой:         {signal.breakout.break_pct:.2f}%")
 
     checks = signal.confirmations
+    ok_count = sum(1 for v in checks.values() if v)
     confirms = []
     for name, ok in checks.items():
         label = name.replace("_ok", "").replace("_", " ").upper()
         confirms.append(f"{'[+]' if ok else '[-]'} {label}")
-    print(f"  Подтверждения:  {' | '.join(confirms)}")
+    print(f"  Подтверждения:  {ok_count}/{len(checks)} — {' | '.join(confirms)}")
 
     print()
     print(f"  ПЛАН ДЕЙСТВИЙ:")
@@ -121,9 +133,10 @@ def print_signal_card(signal, config, equity=None):
     else:
         print(f"  1. Открыть SHORT {signal.symbol} по рынку")
     print(f"  2. Стоп-лосс:  {format_price(sl)}")
-    print(f"  3. При {format_price(tp1)} — закрыть 50%, SL перенести в безубыток")
-    print(f"  4. Остаток — TP на {format_price(tp2)} или трейлинг-стоп")
-    print(f"  {'='*52}")
+    print(f"  3. При {format_price(tp1)} — закрыть {tp1_close}%, SL в безубыток")
+    print(f"  4. При {format_price(tp2)} — закрыть {tp2_close}%, SL подтянуть")
+    print(f"  5. Остаток {tp3_close}% — TP на {format_price(tp3)} или трейлинг-стоп")
+    print(f"  {'='*56}")
     print()
 
 
@@ -168,8 +181,14 @@ def cmd_signal(config: dict, args: argparse.Namespace):
         last = df_ind.iloc[-1]
         rsi = last.get("rsi", 0)
         trend = indicators.get_trend_bias(df_ind)
+        regime_info = indicators.get_regime_info(df_ind)
+        regime_label = {"trending": "ТРЕНД", "ranging": "БОКОВИК", "squeeze": "СЖАТИЕ"}.get(
+            regime_info["regime"], "?")
+
         print(f"  RSI:         {rsi:.1f}")
         print(f"  Тренд:       {trend.upper()}")
+        print(f"  ADX:         {regime_info['adx']:.1f}")
+        print(f"  Режим рынка: {regime_label} {'(торгуем)' if regime_info['tradeable'] else '(ждём)'}")
         print(f"  MACD:        {last.get('macd_histogram', 0):.4f}")
 
         if trendlines:
