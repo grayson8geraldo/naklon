@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Naklon — Crypto Intraday Trendline (Наклонки) Trading Strategy
+Naklon — Разгон депозита по наклонкам
 
-Главный модуль:
-  - backtest:  Запуск бэктеста на исторических/синтетических данных
-  - live:      Подключение к бирже (ccxt) и живой мониторинг сигналов
-  - analyze:   Анализ текущих наклонок на графике
+Стратегия интрадей-торговли криптовалют на 5м ТФ.
+Депозит: $100-200, фьючерсы с плечом x10.
 
-Usage:
-  python main.py backtest [--symbol BTC/USDT] [--bars 1000]
-  python main.py analyze  [--symbol BTC/USDT]
-  python main.py live     [--symbol BTC/USDT]
+Команды:
+  python main.py signal     — Показать текущий сигнал (ВХОД ПРЯМО СЕЙЧАС)
+  python main.py scan       — Сканировать несколько пар
+  python main.py backtest   — Прогнать на истории
+  python main.py monitor    — Следить за сигналами в реальном времени
 """
 
 import argparse
@@ -22,49 +21,289 @@ from naklon.backtest.backtester import Backtester
 from naklon.data.fetcher import DataFetcher
 from naklon.indicators.technical import TechnicalIndicators
 from naklon.indicators.trendline import TrendlineDetector
+from naklon.strategy.signals import SignalGenerator, SignalType
+from naklon.strategy.risk import RiskManager
 from naklon.utils.config import load_config
 from naklon.utils.logger import setup_logger
 
 
+def format_price(price: float) -> str:
+    """Format price based on magnitude."""
+    if price >= 1000:
+        return f"{price:,.2f}"
+    elif price >= 1:
+        return f"{price:.4f}"
+    else:
+        return f"{price:.6f}"
+
+
+def print_signal_card(signal, config, equity=None):
+    """Print a clear, actionable signal card.
+
+    Формат: всё что нужно для входа — копируй цифры на биржу.
+    """
+    if equity is None:
+        equity = config["capital"]["initial"]
+
+    leverage = config.get("risk_management", {}).get("leverage", 10)
+    risk_pct = config.get("risk_management", {}).get("max_risk_per_trade_pct", 3.0)
+
+    entry = signal.entry_price
+    sl = signal.stop_loss
+    risk = abs(entry - sl)
+
+    if signal.type == SignalType.LONG:
+        direction = "LONG"
+        arrow = "^"
+        tp1 = entry + risk * 1.0
+        tp2 = entry + risk * 2.0
+        sl_pct = (entry - sl) / entry * 100
+        tp1_pct = (tp1 - entry) / entry * 100
+        tp2_pct = (tp2 - entry) / entry * 100
+    else:
+        direction = "SHORT"
+        arrow = "v"
+        tp1 = entry - risk * 1.0
+        tp2 = entry - risk * 2.0
+        sl_pct = (sl - entry) / entry * 100
+        tp1_pct = (entry - tp1) / entry * 100
+        tp2_pct = (entry - tp2) / entry * 100
+
+    # Position sizing
+    risk_amount = equity * (risk_pct / 100)
+    risk_per_unit = abs(entry - sl)
+    quantity = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
+    margin = (quantity * entry) / leverage
+    notional = quantity * entry
+
+    sl_pct_leverage = sl_pct * leverage
+    tp1_pct_leverage = tp1_pct * leverage
+    tp2_pct_leverage = tp2_pct * leverage
+
+    print()
+    print(f"  {'='*52}")
+    print(f"  {arrow}{arrow}{arrow}  {direction}  {signal.symbol}  x{leverage}  {arrow}{arrow}{arrow}")
+    print(f"  {'='*52}")
+    print()
+    print(f"  ВХОД:          {format_price(entry)}")
+    print(f"  СТОП-ЛОСС:     {format_price(sl)}   (-{sl_pct:.2f}% / -{sl_pct_leverage:.1f}% с плечом)")
+    print(f"  ТЕЙК 1 (50%):  {format_price(tp1)}   (+{tp1_pct:.2f}% / +{tp1_pct_leverage:.1f}% с плечом)")
+    print(f"  ТЕЙК 2 (50%):  {format_price(tp2)}   (+{tp2_pct:.2f}% / +{tp2_pct_leverage:.1f}% с плечом)")
+    print()
+    print(f"  {'─'*52}")
+    print(f"  Депозит:        ${equity:.2f}")
+    print(f"  Маржа:          ${margin:.2f}")
+    print(f"  Размер позиции: ${notional:.2f}")
+    print(f"  Риск на сделку: ${risk_amount:.2f} ({risk_pct}%)")
+    print()
+    print(f"  При TP1 (+R:R 1:1):  +${risk_amount:.2f} на депозит")
+    print(f"  При TP2 (+R:R 1:2):  +${risk_amount * 2:.2f} на депозит")
+    print(f"  При SL:              -${risk_amount:.2f} с депозита")
+    print()
+    print(f"  {'─'*52}")
+    print(f"  Сила сигнала:   {signal.strength.value.upper()} ({signal.score:.0f}/100)")
+    print(f"  Наклонка:       {signal.breakout.trendline.type.value} | "
+          f"касаний: {signal.breakout.trendline.touches} | "
+          f"угол: {signal.breakout.trendline.angle_deg:.1f}")
+    print(f"  Пробой:         {signal.breakout.break_pct:.2f}%")
+
+    checks = signal.confirmations
+    confirms = []
+    for name, ok in checks.items():
+        label = name.replace("_ok", "").replace("_", " ").upper()
+        confirms.append(f"{'[+]' if ok else '[-]'} {label}")
+    print(f"  Подтверждения:  {' | '.join(confirms)}")
+
+    print()
+    print(f"  ПЛАН ДЕЙСТВИЙ:")
+    if signal.type == SignalType.LONG:
+        print(f"  1. Открыть LONG {signal.symbol} по рынку")
+    else:
+        print(f"  1. Открыть SHORT {signal.symbol} по рынку")
+    print(f"  2. Стоп-лосс:  {format_price(sl)}")
+    print(f"  3. При {format_price(tp1)} — закрыть 50%, SL перенести в безубыток")
+    print(f"  4. Остаток — TP на {format_price(tp2)} или трейлинг-стоп")
+    print(f"  {'='*52}")
+    print()
+
+
+def cmd_signal(config: dict, args: argparse.Namespace):
+    """Show current signal for a symbol — the main command."""
+    logger = setup_logger("naklon", "WARNING")
+
+    symbol = args.symbol or config["symbols"][0]
+
+    if args.live_data:
+        fetcher = DataFetcher(config)
+        timeframe = config["timeframes"]["primary"]
+        df = fetcher.fetch_ohlcv(symbol, timeframe, limit=200)
+        if df.empty:
+            print(f"\n  Не удалось загрузить данные для {symbol}")
+            sys.exit(1)
+    else:
+        df = DataFetcher.generate_sample_data(
+            bars=500, base_price=args.base_price,
+            seed=args.seed, volatility=0.04,
+        )
+
+    signal_gen = SignalGenerator(config)
+    signals = signal_gen.generate_signals(
+        df, symbol, config["timeframes"]["primary"],
+    )
+
+    if not signals:
+        last_close = df["close"].iloc[-1]
+        indicators = TechnicalIndicators(config)
+        df_ind = indicators.calculate_all(df)
+        detector = TrendlineDetector(config)
+        trendlines = detector.detect_trendlines(df)
+
+        print()
+        print(f"  {'='*52}")
+        print(f"  НЕТ СИГНАЛА — {symbol}")
+        print(f"  {'='*52}")
+        print(f"  Цена:        {format_price(last_close)}")
+        print(f"  Наклонок:    {len(trendlines)}")
+
+        last = df_ind.iloc[-1]
+        rsi = last.get("rsi", 0)
+        trend = indicators.get_trend_bias(df_ind)
+        print(f"  RSI:         {rsi:.1f}")
+        print(f"  Тренд:       {trend.upper()}")
+        print(f"  MACD:        {last.get('macd_histogram', 0):.4f}")
+
+        if trendlines:
+            print(f"\n  Ближайшие наклонки:")
+            for i, tl in enumerate(trendlines[:3], 1):
+                tl_price = tl.price_at(len(df) - 1)
+                dist = (last_close - tl_price) / last_close * 100
+                print(f"    #{i} [{tl.type.value}] @ {format_price(tl_price)} "
+                      f"({dist:+.2f}% от цены) | "
+                      f"касаний: {tl.touches}")
+            print(f"\n  Ждём пробоя наклонки для входа.")
+        else:
+            print(f"\n  Наклонки не сформированы. Ждём.")
+
+        print(f"  {'='*52}")
+        print()
+        return
+
+    # Show the best signal
+    best = signals[0]
+    equity = config["capital"]["initial"]
+    print_signal_card(best, config, equity)
+
+    # If there are more signals
+    if len(signals) > 1:
+        print(f"  + ещё {len(signals) - 1} сигнал(ов). Используй --symbol для другой пары.")
+
+
+def cmd_scan(config: dict, args: argparse.Namespace):
+    """Scan multiple symbols for signals."""
+    logger = setup_logger("naklon", "WARNING")
+    symbols = config["symbols"]
+
+    print()
+    print(f"  {'='*60}")
+    print(f"  СКАНИРОВАНИЕ — {len(symbols)} пар | 5м ТФ | x{config['risk_management'].get('leverage', 10)}")
+    print(f"  {'='*60}")
+
+    found_signals = []
+
+    for symbol in symbols:
+        if args.live_data:
+            fetcher = DataFetcher(config)
+            df = fetcher.fetch_ohlcv(symbol, config["timeframes"]["primary"], limit=200)
+            if df.empty:
+                print(f"  {symbol}: ошибка загрузки")
+                continue
+        else:
+            import hashlib
+            seed = int(hashlib.md5(symbol.encode()).hexdigest()[:8], 16) % 10000
+            base = {"BTC/USDT": 60000, "ETH/USDT": 3000, "SOL/USDT": 150,
+                    "BNB/USDT": 600, "XRP/USDT": 0.6}.get(symbol, 1000)
+            df = DataFetcher.generate_sample_data(
+                bars=500, base_price=base, seed=seed, volatility=0.04,
+            )
+
+        signal_gen = SignalGenerator(config)
+        signals = signal_gen.generate_signals(
+            df, symbol, config["timeframes"]["primary"],
+        )
+
+        last_close = df["close"].iloc[-1]
+
+        if signals:
+            s = signals[0]
+            direction = "LONG" if s.type == SignalType.LONG else "SHORT"
+            found_signals.append((symbol, s))
+            print(f"  {symbol:12s}  {format_price(last_close):>12s}  "
+                  f">>> {direction:5s} | Score: {s.score:.0f} | "
+                  f"{s.strength.value.upper()}")
+        else:
+            detector = TrendlineDetector(config)
+            tls = detector.detect_trendlines(df)
+            print(f"  {symbol:12s}  {format_price(last_close):>12s}  "
+                  f"    нет сигнала | наклонок: {len(tls)}")
+
+    print(f"  {'='*60}")
+
+    if found_signals:
+        print(f"\n  Найдено {len(found_signals)} сигнал(ов)!\n")
+        for symbol, signal in found_signals:
+            print_signal_card(signal, config, config["capital"]["initial"])
+    else:
+        print(f"\n  Сигналов нет. Ждём пробоев наклонок.")
+    print()
+
+
 def cmd_backtest(config: dict, args: argparse.Namespace):
-    """Run backtest on historical or synthetic data."""
+    """Run backtest."""
     logger = setup_logger("naklon", config["logging"]["level"], config["logging"]["file"])
 
     symbol = args.symbol or config["symbols"][0]
     bars = args.bars
+    leverage = config.get("risk_management", {}).get("leverage", 10)
 
-    logger.info("=" * 60)
-    logger.info("  NAKLON — Backtest Mode")
-    logger.info("  Стратегия: Торговля по наклонкам (Trendline Breakout)")
-    logger.info("  Capital: $%s | Symbol: %s", config["capital"]["initial"], symbol)
-    logger.info("=" * 60)
+    print()
+    print(f"  {'='*52}")
+    print(f"  БЭКТЕСТ — {symbol} | 5м | x{leverage}")
+    print(f"  Депозит: ${config['capital']['initial']}")
+    print(f"  {'='*52}")
 
-    # Get data
     if args.live_data:
         fetcher = DataFetcher(config)
-        timeframe = config["timeframes"]["primary"]
-        df = fetcher.fetch_ohlcv(symbol, timeframe, limit=bars)
+        df = fetcher.fetch_ohlcv(symbol, config["timeframes"]["primary"], limit=bars)
         if df.empty:
-            logger.error("Failed to fetch data from exchange.")
+            print("  Ошибка загрузки данных")
             sys.exit(1)
     else:
-        logger.info("Using synthetic data (%d bars, seed=%d)", bars, args.seed)
         df = DataFetcher.generate_sample_data(
-            bars=bars,
-            base_price=args.base_price,
-            volatility=args.volatility,
-            seed=args.seed,
+            bars=bars, base_price=args.base_price,
+            seed=args.seed, volatility=0.04,
         )
 
-    # Run backtest
     backtester = Backtester(config)
-    timeframe = config["timeframes"]["primary"]
-    result = backtester.run(df, symbol, timeframe)
+    result = backtester.run(df, symbol, config["timeframes"]["primary"])
 
-    # Print results
     print(result.summary())
 
-    # Save trade log
+    # Show individual trades
+    if result.trades:
+        print(f"  Последние сделки:")
+        print(f"  {'─'*60}")
+        for t in result.trades[-10:]:
+            side = t["side"].upper()
+            pnl_key = "risk_amount"
+            entry = t["entry_price"]
+            tp1 = t.get("tp1", t.get("take_profit", 0))
+            sl = t["stop_loss"]
+            score = t["signal_score"]
+            print(f"  {side:5s} @ {format_price(entry)} | "
+                  f"SL: {format_price(sl)} | TP1: {format_price(tp1)} | "
+                  f"Score: {score:.0f}")
+        print()
+
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,9 +312,6 @@ def cmd_backtest(config: dict, args: argparse.Namespace):
                 "summary": {
                     "symbol": result.symbol,
                     "timeframe": result.timeframe,
-                    "start_date": result.start_date,
-                    "end_date": result.end_date,
-                    "total_bars": result.total_bars,
                     "total_trades": result.total_trades,
                     "win_rate_pct": result.win_rate_pct,
                     "total_pnl": result.total_pnl,
@@ -87,191 +323,131 @@ def cmd_backtest(config: dict, args: argparse.Namespace):
                 },
                 "trades": result.trades,
             }, f, indent=2, default=str)
-        logger.info("Results saved to %s", args.output)
+        print(f"  Результаты сохранены: {args.output}")
 
 
-def cmd_analyze(config: dict, args: argparse.Namespace):
-    """Analyze current trendlines for a symbol."""
-    logger = setup_logger("naklon", config["logging"]["level"], config["logging"]["file"])
-
-    symbol = args.symbol or config["symbols"][0]
-
-    logger.info("=" * 60)
-    logger.info("  NAKLON — Analyze Mode")
-    logger.info("  Analyzing trendlines for %s", symbol)
-    logger.info("=" * 60)
-
-    # Get data
-    if args.live_data:
-        fetcher = DataFetcher(config)
-        timeframe = config["timeframes"]["primary"]
-        df = fetcher.fetch_ohlcv(symbol, timeframe, limit=args.bars)
-    else:
-        df = DataFetcher.generate_sample_data(bars=args.bars, seed=args.seed)
-
-    # Calculate indicators
-    indicators = TechnicalIndicators(config)
-    df = indicators.calculate_all(df)
-
-    # Detect trendlines
-    detector = TrendlineDetector(config)
-    trendlines = detector.detect_trendlines(df)
-
-    if not trendlines:
-        print(f"\nNo valid trendlines found for {symbol}")
-        return
-
-    print(f"\n{'='*60}")
-    print(f"  Found {len(trendlines)} trendlines (наклонок) for {symbol}")
-    print(f"{'='*60}")
-
-    for i, tl in enumerate(trendlines, 1):
-        print(f"\n  #{i} [{tl.type.value.upper()}]")
-        print(f"  Touches: {tl.touches} | Angle: {tl.angle_deg:.1f}°")
-        print(f"  Strength: {tl.strength:.2f}")
-        print(f"  Start: bar {tl.start_idx} @ {tl.start_price:.2f}")
-        print(f"  End:   bar {tl.end_idx} @ {tl.end_price:.2f}")
-        print(f"  Slope: {tl.slope:.4f}/bar")
-
-    # Check for breakouts at last bar
-    breakouts = detector.detect_breakout(df, trendlines)
-    if breakouts:
-        print(f"\n{'─'*60}")
-        print(f"  ACTIVE BREAKOUT SIGNALS:")
-        for bo in breakouts:
-            print(f"  → {bo.direction.value.upper()} breakout!")
-            print(f"    Break price: {bo.break_price:.2f}")
-            print(f"    Trendline at: {bo.trendline_price:.2f}")
-            print(f"    Break size: {bo.break_pct:.3f}%")
-            print(f"    Volume confirmed: {'YES' if bo.volume_confirmed else 'NO'}")
-    else:
-        print(f"\n  No active breakouts at current bar.")
-
-    # Show current indicator snapshot
-    trend_bias = indicators.get_trend_bias(df)
-    last = df.iloc[-1]
-    print(f"\n{'─'*60}")
-    print(f"  INDICATOR SNAPSHOT:")
-    print(f"  Trend bias: {trend_bias.upper()}")
-    print(f"  RSI: {last.get('rsi', 0):.1f}")
-    print(f"  MACD Hist: {last.get('macd_histogram', 0):.4f}")
-    print(f"  ATR: {last.get('atr', 0):.2f} ({last.get('atr_pct', 0):.2f}%)")
-    print(f"  Volume ratio: {last.get('volume_ratio', 0):.2f}x")
-    print(f"  BB position: {last.get('bb_position', 0):.2f}")
-    print(f"{'='*60}\n")
-
-
-def cmd_live(config: dict, args: argparse.Namespace):
-    """Run live monitoring (signal generation only — no auto-execution)."""
-    logger = setup_logger("naklon", config["logging"]["level"], config["logging"]["file"])
+def cmd_monitor(config: dict, args: argparse.Namespace):
+    """Live monitoring mode — prints signals as they appear."""
+    logger = setup_logger("naklon", "WARNING")
 
     symbol = args.symbol or config["symbols"][0]
     timeframe = config["timeframes"]["primary"]
-
-    logger.info("=" * 60)
-    logger.info("  NAKLON — Live Monitor Mode")
-    logger.info("  Monitoring %s on %s timeframe", symbol, timeframe)
-    logger.info("  Capital: $%s", config["capital"]["initial"])
-    logger.info("  NOTE: Signal monitoring only. No auto-execution.")
-    logger.info("=" * 60)
-
-    fetcher = DataFetcher(config)
-    indicators = TechnicalIndicators(config)
-    detector = TrendlineDetector(config)
+    leverage = config.get("risk_management", {}).get("leverage", 10)
 
     import time
 
-    # Determine sleep interval from timeframe
     tf_seconds = {
         "1m": 60, "3m": 180, "5m": 300, "15m": 900,
-        "30m": 1800, "1h": 3600, "4h": 14400,
+        "30m": 1800, "1h": 3600,
     }
-    interval = tf_seconds.get(timeframe, 900)
+    interval = tf_seconds.get(timeframe, 300)
 
-    print(f"\nMonitoring {symbol} ({timeframe}). Press Ctrl+C to stop.\n")
+    print()
+    print(f"  {'='*52}")
+    print(f"  МОНИТОРИНГ — {symbol} | {timeframe} | x{leverage}")
+    print(f"  Обновление каждые {interval // 60} мин. Ctrl+C для выхода.")
+    print(f"  {'='*52}")
+    print()
+
+    fetcher = DataFetcher(config)
+    last_signal_bar = -1
 
     try:
         while True:
             df = fetcher.fetch_ohlcv(symbol, timeframe, limit=200)
             if df.empty:
-                logger.warning("No data received, retrying...")
+                print("  Нет данных, повтор через 30с...")
                 time.sleep(30)
                 continue
 
-            df = indicators.calculate_all(df)
-            trendlines = detector.detect_trendlines(df)
-            breakouts = detector.detect_breakout(df, trendlines) if trendlines else []
+            signal_gen = SignalGenerator(config)
+            signals = signal_gen.generate_signals(df, symbol, timeframe)
 
             last = df.iloc[-1]
-            ts = last.get("timestamp", "")
+            ts = str(last.get("timestamp", ""))[:19]
             price = last["close"]
 
-            status = (
-                f"[{ts}] {symbol} = {price:.2f} | "
-                f"Trendlines: {len(trendlines)} | "
-                f"RSI: {last.get('rsi', 0):.1f} | "
-                f"MACD: {last.get('macd_histogram', 0):.4f}"
-            )
+            if signals:
+                s = signals[0]
+                if s.bar_idx != last_signal_bar:
+                    last_signal_bar = s.bar_idx
+                    print(f"\n  !!! НОВЫЙ СИГНАЛ в {ts} !!!\n")
+                    print_signal_card(s, config, config["capital"]["initial"])
+            else:
+                indicators = TechnicalIndicators(config)
+                df_ind = indicators.calculate_all(df)
+                r = df_ind.iloc[-1]
+                detector = TrendlineDetector(config)
+                tls = detector.detect_trendlines(df)
+                print(f"  [{ts}] {symbol} = {format_price(price)} | "
+                      f"RSI: {r.get('rsi', 0):.0f} | "
+                      f"Наклонок: {len(tls)} | "
+                      f"Ждём...")
 
-            if breakouts:
-                for bo in breakouts:
-                    status += (
-                        f" | *** {bo.direction.value.upper()} BREAKOUT "
-                        f"({bo.break_pct:.2f}%, "
-                        f"vol={'YES' if bo.volume_confirmed else 'NO'}) ***"
-                    )
-
-            print(status)
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        print("\nMonitoring stopped.")
+        print("\n  Мониторинг остановлен.\n")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Naklon — Crypto Intraday Trendline Trading Strategy",
+        description="Naklon — Разгон депозита по наклонкам",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры:
+  python main.py signal                           Сигнал на синтетике
+  python main.py signal --symbol BTC/USDT --live  Сигнал по реальным данным
+  python main.py scan --live                      Сканировать все пары
+  python main.py backtest --bars 3000             Бэктест
+  python main.py monitor --symbol ETH/USDT        Мониторинг в реалтайме
+        """,
     )
-    parser.add_argument(
-        "--config", "-c", default=None,
-        help="Path to config.yaml",
-    )
+    parser.add_argument("--config", "-c", default=None, help="Путь к config.yaml")
 
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    subparsers = parser.add_subparsers(dest="command", help="Команда")
+
+    # Signal command
+    sig = subparsers.add_parser("signal", help="Показать текущий сигнал")
+    sig.add_argument("--symbol", "-s", default=None, help="Торговая пара")
+    sig.add_argument("--live", "--live-data", dest="live_data", action="store_true",
+                     help="Реальные данные с биржи")
+    sig.add_argument("--seed", type=int, default=42, help="Seed для синтетики")
+    sig.add_argument("--base-price", type=float, default=60000.0, help="Базовая цена")
+
+    # Scan command
+    sc = subparsers.add_parser("scan", help="Сканировать все пары")
+    sc.add_argument("--live", "--live-data", dest="live_data", action="store_true",
+                    help="Реальные данные с биржи")
 
     # Backtest command
-    bt_parser = subparsers.add_parser("backtest", help="Run backtest")
-    bt_parser.add_argument("--symbol", "-s", default=None, help="Trading pair")
-    bt_parser.add_argument("--bars", "-b", type=int, default=1000, help="Number of bars")
-    bt_parser.add_argument("--live-data", action="store_true", help="Use live exchange data")
-    bt_parser.add_argument("--seed", type=int, default=42, help="Random seed for synthetic data")
-    bt_parser.add_argument("--base-price", type=float, default=60000.0, help="Base price for synthetic data")
-    bt_parser.add_argument("--volatility", type=float, default=0.02, help="Volatility for synthetic data")
-    bt_parser.add_argument("--output", "-o", default=None, help="Output JSON file path")
+    bt = subparsers.add_parser("backtest", help="Бэктест стратегии")
+    bt.add_argument("--symbol", "-s", default=None, help="Торговая пара")
+    bt.add_argument("--bars", "-b", type=int, default=2000, help="Количество баров")
+    bt.add_argument("--live", "--live-data", dest="live_data", action="store_true",
+                    help="Реальные данные")
+    bt.add_argument("--seed", type=int, default=42, help="Seed")
+    bt.add_argument("--base-price", type=float, default=60000.0, help="Базовая цена")
+    bt.add_argument("--output", "-o", default=None, help="Сохранить в JSON")
 
-    # Analyze command
-    az_parser = subparsers.add_parser("analyze", help="Analyze trendlines")
-    az_parser.add_argument("--symbol", "-s", default=None, help="Trading pair")
-    az_parser.add_argument("--bars", "-b", type=int, default=500, help="Number of bars")
-    az_parser.add_argument("--live-data", action="store_true", help="Use live exchange data")
-    az_parser.add_argument("--seed", type=int, default=42, help="Random seed")
-
-    # Live command
-    lv_parser = subparsers.add_parser("live", help="Live monitoring")
-    lv_parser.add_argument("--symbol", "-s", default=None, help="Trading pair")
+    # Monitor command
+    mo = subparsers.add_parser("monitor", help="Мониторинг сигналов")
+    mo.add_argument("--symbol", "-s", default=None, help="Торговая пара")
 
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
+        print("\n  Быстрый старт: python main.py signal\n")
         sys.exit(0)
 
     config = load_config(args.config)
 
     commands = {
+        "signal": cmd_signal,
+        "scan": cmd_scan,
         "backtest": cmd_backtest,
-        "analyze": cmd_analyze,
-        "live": cmd_live,
+        "monitor": cmd_monitor,
     }
 
     commands[args.command](config, args)

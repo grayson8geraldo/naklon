@@ -132,14 +132,29 @@ class StrategyEngine:
         side = (
             PositionSide.LONG if signal.type == SignalType.LONG else PositionSide.SHORT
         )
+
+        # Calculate TP1 (partial) and TP2 (full) based on R:R
+        risk = abs(signal.entry_price - signal.stop_loss)
+        if signal.type == SignalType.LONG:
+            tp1 = signal.entry_price + risk * 1.0   # TP1 at R:R 1:1
+            tp2 = signal.entry_price + risk * 2.0   # TP2 at R:R 1:2
+        else:
+            tp1 = signal.entry_price - risk * 1.0
+            tp2 = signal.entry_price - risk * 2.0
+
+        leverage = self.risk_manager.leverage
+        margin = (quantity * signal.entry_price) / leverage
+        notional = quantity * signal.entry_price
+
         pos = self.risk_manager.open_position(
             symbol=symbol,
             side=side,
             entry_price=signal.entry_price,
             quantity=quantity,
             stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
+            take_profit=tp1,
             entry_time=current_time,
+            take_profit_2=tp2,
         )
 
         # Log the trade
@@ -151,9 +166,12 @@ class StrategyEngine:
             "side": side.value,
             "entry_price": signal.entry_price,
             "quantity": round(quantity, 8),
-            "notional_value": round(quantity * signal.entry_price, 2),
+            "notional_value": round(notional, 2),
+            "margin": round(margin, 2),
+            "leverage": leverage,
             "stop_loss": signal.stop_loss,
-            "take_profit": signal.take_profit,
+            "tp1": round(tp1, 2),
+            "tp2": round(tp2, 2),
             "risk_amount": round(risk_amount, 2),
             "risk_reward": signal.risk_reward,
             "signal_score": signal.score,
@@ -167,17 +185,16 @@ class StrategyEngine:
         self._trade_log.append(trade_info)
 
         logger.info(
-            "OPEN %s %s | Entry: %.2f | SL: %.2f | TP: %.2f | "
-            "Size: %.6f (≈$%.2f) | Risk: $%.2f | R:R 1:%.1f | Score: %.1f",
+            "OPEN %s %s x%d | Entry: %.2f | SL: %.2f | TP1: %.2f | TP2: %.2f | "
+            "Margin: $%.2f | Risk: $%.2f | Score: %.1f",
             side.value.upper(),
             symbol,
+            leverage,
             signal.entry_price,
             signal.stop_loss,
-            signal.take_profit,
-            quantity,
-            quantity * signal.entry_price,
+            tp1, tp2,
+            margin,
             risk_amount,
-            signal.risk_reward,
             signal.score,
         )
 
