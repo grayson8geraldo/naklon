@@ -114,3 +114,14 @@ exit_rules:
 logging:
   level: INFO
   file: logs/naklon.log
+
+# === TELEGRAM УВЕДОМЛЕНИЯ ===
+# 1. Создай бота: @BotFather -> /newbot -> скопируй токен
+# 2. Напиши боту /start
+# 3. Узнай chat_id: напиши @userinfobot или @getmyid_bot
+telegram:
+  enabled: true
+  bot_token: ""              # Токен от @BotFather
+  chat_id: ""                # Твой chat_id
+  send_startup: true         # Уведомить о старте мониторинга
+  send_no_signal_summary: false  # Периодический статус (даже если нет сигналов)

@@ -21,6 +21,7 @@ from naklon.backtest.backtester import Backtester
 from naklon.data.fetcher import DataFetcher
 from naklon.indicators.technical import TechnicalIndicators
 from naklon.indicators.trendline import TrendlineDetector
+from naklon.notifications.telegram import TelegramNotifier
 from naklon.strategy.signals import SignalGenerator, SignalType
 from naklon.strategy.risk import RiskManager
 from naklon.utils.config import load_config
@@ -375,6 +376,9 @@ def cmd_monitor(config: dict, args: argparse.Namespace):
     timeframe = config["timeframes"]["primary"]
     leverage = config.get("risk_management", {}).get("leverage", 10)
 
+    # Telegram notifier
+    tg = TelegramNotifier(config)
+
     import time
 
     tf_seconds = {
@@ -422,6 +426,11 @@ def cmd_monitor(config: dict, args: argparse.Namespace):
         print(f"  Пересканирование объёмов каждые {rescan_mins} мин.")
     print(f"  {'='*64}")
     print()
+
+    # Telegram: startup notification
+    tg_cfg = config.get("telegram", {})
+    if tg_cfg.get("send_startup", True):
+        tg.send_startup(symbols, mode, timeframe)
 
     last_signal_bars = {sym: -1 for sym in symbols}
     last_rescan = time.time()
@@ -471,6 +480,7 @@ def cmd_monitor(config: dict, args: argparse.Namespace):
                         found_any = True
                         print(f"\n  !!! НОВЫЙ СИГНАЛ {symbol} в {ts} !!!\n")
                         print_signal_card(s, config, config["capital"]["initial"])
+                        tg.send_signal(s, config)
                 else:
                     indicators = TechnicalIndicators(config)
                     df_ind = indicators.calculate_all(df)
